@@ -1,0 +1,123 @@
+from firebase_admin import firestore
+from flask import request, jsonify
+from common import fdb
+from settings import *
+from datetime import datetime, timezone
+from firebase_admin.firestore import GeoPoint, FieldFilter
+import traceback
+
+
+distanceToPrecision = {
+    5: 5,
+    39: 4,
+    156: 3,
+    1250: 2,
+    5000: 1,
+  }
+
+def getServices_fn(request):
+    try:
+        pdata = request.get_json()
+        lg.t("getServices_fn called w pdata ~ " + str(pdata))
+
+        limit = 10
+
+        if "category" not in pdata and "keyword" not in pdata \
+        and "location" not in pdata and "rating" not in pdata:
+
+            if "lastGeoHash" not in pdata:
+                lg.t("getServices_fn no geoHash ~ ")
+                query = fdb.collection('services')
+            if "lastGeoHash" in pdata:
+                lg.t("getServices_fn geoHash ~ " + pdata["lastGeoHash"])
+                prefix = pdata["lastGeoHash"]
+                prefix = prefix[0:1]
+                query = fdb.collection('services') \
+                    .where('geoHash', '>=', prefix) \
+                    .where('geoHash', '<=', prefix + '\uf8ff') \
+                    .order_by('geoHash') \
+                    .order_by('__name__')  # Document ID ordering
+            if "lastDocId" in pdata and "lastGeoHash" in pdata:
+                lg.t("getServices_fn lastDocId ~ " + str(pdata["lastDocId"]))
+                last_doc_id = pdata["lastDocId"]
+                prefix = pdata["lastGeoHash"]
+                prefix = prefix[0:1]
+                query = query.start_after([
+                    prefix,
+                    last_doc_id]
+                )
+        lg.t("getServices_fn query ~ ")
+        docs = query.limit(limit).stream()
+
+        services = []
+        for doc in docs:
+            data = doc.to_dict()
+            lg.t("appending doc ~ " + str(data))
+            data['id'] = doc.id
+            data["createTime"] = data["createTime"].isoformat().replace('+00:00', 'Z')
+            if 'location' in data:
+                if isinstance(data['location'], GeoPoint):
+                        data["location"] = {'lat': data['location'].latitude, 'lng': data['location'].longitude}
+            services.append(data)
+
+        lg.t("returning services len ~ " + str(len(services)))
+        response = {'success': True,
+        'services': services,
+        }
+
+        if len(services)> 0:
+            response['lastGeoHash'] = services[-1]["geoHash"]
+            response['lastDocId'] = services[-1]["id"]
+
+        return jsonify(response)
+
+    except Exception as e:
+        lg.e("Exception caught ~ ", str(e))
+        lg.e("Exception st ~ ", traceback.format_exc())
+        return jsonify({'success': False,
+        'error': str(e),
+        'trace': traceback.format_exc()
+        }), 500
+
+
+def getVendorServices_fn(request):
+    try:
+        pdata = request.get_json()
+        lg.t("getVendorServices_fn called w pdata ~ " + str(pdata))
+        pdata = request.get_json()
+
+        lg.t("getVendorServices_fn start query ~ ")
+        query = fdb.collection('services') \
+            .where(filter=FieldFilter("vendorUserId", "==", pdata['vendorUserId'])) \
+            .order_by('createTime', direction=firestore.Query.DESCENDING)
+        #             .filter(field_path='vendorUserId', op_string='==', value=pdata['vendorUserId']) \
+
+        lg.t("getVendorServices_fn fin query ~ ")
+        docs = query.stream()
+
+        services = []
+        for doc in docs:
+            data = doc.to_dict()
+            data['id'] = doc.id
+            data["createTime"] = data["createTime"].isoformat().replace('+00:00', 'Z')
+            if "location" in data:
+                if isinstance(data['location'], GeoPoint):
+                    data["location"] = {'lat': data['location'].latitude, 'lng': data['location'].longitude}
+            services.append(data)
+
+        lg.t("returning services len ~ " + str(len(services)))
+        response = {'success': True,
+        'services': services,
+        }
+
+        if len(services)> 0:
+            response['lastGeoHash'] = services[-1]["geoHash"]
+            response['lastDocId'] = services[-1]["id"]
+
+        return jsonify(response)
+
+    except Exception as e:
+        return jsonify({'success': False,
+        'error': str(e),
+        'trace': traceback.format_exc()
+        }), 500
