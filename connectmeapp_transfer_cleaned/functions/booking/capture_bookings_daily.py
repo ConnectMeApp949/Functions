@@ -35,6 +35,36 @@ from settings import (
 
 BOOKINGS_V2 = "bookings_v2"
 USERS_V2 = "users_v2"
+NOTIFICATIONS_V2 = "notifications_v2"
+SYSTEM_SENDER_UID = "system"
+
+
+def _notify(recipient_uid: str, wire_type: str, title: str, body: str,
+            related_id: str) -> None:
+    """Drop a doc into notifications_v2/{uid}/items. Mirrors the
+    client-side NotificationsRequests.create shape, so the Phase 103
+    FCM Cloud Function (when deployed) picks it up and pushes.
+
+    `fromUserId` is "system" — the items rule on the client is enforced
+    only for client writes; admin SDK bypasses rules, so we can label
+    truthfully. Uses the 'other' type on the client enum (any unknown
+    type string falls through to `other` in AppNotificationType.fromString).
+    """
+    if not recipient_uid:
+        return
+    try:
+        fdb.collection(NOTIFICATIONS_V2).document(recipient_uid)\
+            .collection("items").add({
+                "fromUserId": SYSTEM_SENDER_UID,
+                "type": wire_type,  # e.g. "payment_captured" — client falls back to "other"
+                "title": title,
+                "body": body,
+                "relatedId": related_id,
+                "createdAt": datetime.now(timezone.utc),
+                "read": False,
+            })
+    except Exception as e:
+        lg.e(f"[captureBookingsDaily] notify {recipient_uid} failed: {e}")
 
 
 def _capture_one(doc):
@@ -56,6 +86,12 @@ def _capture_one(doc):
             "paymentError": "missing fields",
             "captureAttemptedAt": datetime.now(timezone.utc),
         })
+        # Notify whichever party we do have an id for.
+        if client_id:
+            _notify(client_id, "payment_failed",
+                    "Payment couldn't be processed",
+                    "We're missing some information for this booking — open Bookings to retry.",
+                    booking_id)
         return
 
     # Resolve Stripe ids from the legacy Stripe collections that
@@ -70,6 +106,10 @@ def _capture_one(doc):
             "paymentError": "missing stripe account",
             "captureAttemptedAt": datetime.now(timezone.utc),
         })
+        _notify(client_id, "payment_failed",
+                "Payment couldn't be processed",
+                "Stripe account setup is incomplete. Open Payment Methods to finish.",
+                booking_id)
         return
 
     client_stripe_customer_id = (client_doc.to_dict() or {}).get("stripe_customer_id")
@@ -80,6 +120,10 @@ def _capture_one(doc):
             "paymentError": "missing stripe ids",
             "captureAttemptedAt": datetime.now(timezone.utc),
         })
+        _notify(client_id, "payment_failed",
+                "Payment couldn't be processed",
+                "Stripe account setup is incomplete. Open Payment Methods to finish.",
+                booking_id)
         return
 
     # Fee math matches makeClientPayment_fn.
@@ -109,11 +153,21 @@ def _capture_one(doc):
     except stripe.error.CardError as e:
         # Declined, insufficient funds, etc.
         lg.e(f"[captureBookingsDaily] {booking_id} card error: {e}")
+        err_msg = str(e.user_message or e)
         fdb.collection(BOOKINGS_V2).document(booking_id).update({
             "paymentStatus": "failed",
-            "paymentError": str(e.user_message or e),
+            "paymentError": err_msg,
             "captureAttemptedAt": datetime.now(timezone.utc),
         })
+        service_name = booking.get("serviceName", "your booking")
+        _notify(client_id, "payment_failed",
+                "Card was declined",
+                f"Your card on file for {service_name} was declined. Open the booking to retry.",
+                booking_id)
+        _notify(vendor_id, "payment_failed",
+                "Client's card was declined",
+                f"The payment for {service_name} failed. You may want to contact the client.",
+                booking_id)
         return
     except Exception as e:
         lg.e(f"[captureBookingsDaily] {booking_id} stripe error: {e}")
@@ -122,9 +176,19 @@ def _capture_one(doc):
             "paymentError": str(e),
             "captureAttemptedAt": datetime.now(timezone.utc),
         })
+        service_name = booking.get("serviceName", "your booking")
+        _notify(client_id, "payment_failed",
+                "Payment couldn't be processed",
+                f"Something went wrong processing payment for {service_name}.",
+                booking_id)
         return
 
     status = intent.status
+
+    service_name = booking.get("serviceName", "your booking")
+    vendor_business = booking.get("vendorBusinessName", "a vendor")
+    client_name = booking.get("clientName", "your client")
+    dollars_label = f"${amount / 100:.2f}"
 
     if status == "succeeded":
         fdb.collection(BOOKINGS_V2).document(booking_id).update({
@@ -148,6 +212,14 @@ def _capture_one(doc):
             "source": "captureBookingsDaily",
         })
         lg.t(f"[captureBookingsDaily] {booking_id} captured {intent.id}")
+        _notify(client_id, "payment_captured",
+                "Payment received",
+                f"{dollars_label} was charged for {service_name} with {vendor_business}.",
+                booking_id)
+        _notify(vendor_id, "payment_captured",
+                "Payment received",
+                f"{dollars_label} from {client_name} for {service_name}.",
+                booking_id)
         return
 
     if status == "requires_action":
@@ -159,6 +231,10 @@ def _capture_one(doc):
             "captureAttemptedAt": datetime.now(timezone.utc),
         })
         lg.w(f"[captureBookingsDaily] {booking_id} needs 3DS")
+        _notify(client_id, "payment_requires_action",
+                "Finish your payment",
+                f"Your bank wants to verify the payment for {service_name}. Open the booking to complete.",
+                booking_id)
         return
 
     # Any other non-success state (requires_payment_method, canceled, etc.)
@@ -168,6 +244,10 @@ def _capture_one(doc):
         "paymentError": f"intent status {status}",
         "captureAttemptedAt": datetime.now(timezone.utc),
     })
+    _notify(client_id, "payment_failed",
+            "Payment couldn't be completed",
+            f"Payment for {service_name} didn't go through. Open the booking to retry.",
+            booking_id)
 
 
 @scheduler_fn.on_schedule(
