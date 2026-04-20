@@ -67,10 +67,19 @@ def _notify(recipient_uid: str, wire_type: str, title: str, body: str,
         lg.e(f"[captureBookingsDaily] notify {recipient_uid} failed: {e}")
 
 
-def _capture_one(doc):
+def capture_booking(doc, attempt_suffix: str | None = None,
+                    source: str = "captureBookingsDaily"):
     """Charge a single booking. Writes status back to the doc + a
     receipt. Swallows Stripe errors so one bad booking doesn't stop
-    the sweep."""
+    the sweep.
+
+    `attempt_suffix` overrides the `%Y%m%d` portion of the Stripe
+    idempotency key so the retry endpoint (Phase 191) can force a
+    fresh attempt on the same day. `source` is recorded in Stripe
+    metadata and the receipt row.
+
+    Returns a small dict describing the outcome so callers (e.g. the
+    retry HTTPS endpoint) can surface a meaningful response."""
     booking = doc.to_dict() or {}
     booking_id = doc.id
 
@@ -80,7 +89,7 @@ def _capture_one(doc):
     amount = int(booking.get("priceCents") or 0)
 
     if not client_id or not vendor_id or not pm_id or amount <= 0:
-        lg.w(f"[captureBookingsDaily] {booking_id} missing fields; skipping")
+        lg.w(f"[{source}] {booking_id} missing fields; skipping")
         fdb.collection(BOOKINGS_V2).document(booking_id).update({
             "paymentStatus": "failed",
             "paymentError": "missing fields",
@@ -92,7 +101,7 @@ def _capture_one(doc):
                     "Payment couldn't be processed",
                     "We're missing some information for this booking — open Bookings to retry.",
                     booking_id)
-        return
+        return {"status": "failed", "reason": "missing fields"}
 
     # Resolve Stripe ids from the legacy Stripe collections that
     # `createClientStripeCustomer` and `createVendorStripeAccountOnboarding`
@@ -100,7 +109,7 @@ def _capture_one(doc):
     client_doc = fdb.collection(stripe_clients_collection).document(client_id).get()
     vendor_doc = fdb.collection(stripe_vendors_collection).document(vendor_id).get()
     if not client_doc.exists or not vendor_doc.exists:
-        lg.w(f"[captureBookingsDaily] {booking_id} missing stripe doc")
+        lg.w(f"[{source}] {booking_id} missing stripe doc")
         fdb.collection(BOOKINGS_V2).document(booking_id).update({
             "paymentStatus": "failed",
             "paymentError": "missing stripe account",
@@ -110,7 +119,7 @@ def _capture_one(doc):
                 "Payment couldn't be processed",
                 "Stripe account setup is incomplete. Open Payment Methods to finish.",
                 booking_id)
-        return
+        return {"status": "failed", "reason": "missing stripe account"}
 
     client_stripe_customer_id = (client_doc.to_dict() or {}).get("stripe_customer_id")
     vendor_stripe_account_id = (vendor_doc.to_dict() or {}).get("stripe_account_id")
@@ -124,13 +133,14 @@ def _capture_one(doc):
                 "Payment couldn't be processed",
                 "Stripe account setup is incomplete. Open Payment Methods to finish.",
                 booking_id)
-        return
+        return {"status": "failed", "reason": "missing stripe ids"}
 
     # Fee math matches makeClientPayment_fn.
     stripe_fee_base = int(round(amount * 0.029 + 30))
     four_percent_fee_plus_base = int(round(amount * 0.039 + 30))
     platform_profit = four_percent_fee_plus_base - stripe_fee_base
 
+    idem_suffix = attempt_suffix or f"{datetime.now(timezone.utc):%Y%m%d}"
     try:
         intent = stripe.PaymentIntent.create(
             amount=four_percent_fee_plus_base,
@@ -146,13 +156,13 @@ def _capture_one(doc):
                 "bookingId": booking_id,
                 "clientId": client_id,
                 "vendorId": vendor_id,
-                "source": "captureBookingsDaily",
+                "source": source,
             },
-            idempotency_key=f"capture-{booking_id}-{datetime.now(timezone.utc):%Y%m%d}",
+            idempotency_key=f"capture-{booking_id}-{idem_suffix}",
         )
     except stripe.error.CardError as e:
         # Declined, insufficient funds, etc.
-        lg.e(f"[captureBookingsDaily] {booking_id} card error: {e}")
+        lg.e(f"[{source}] {booking_id} card error: {e}")
         err_msg = str(e.user_message or e)
         fdb.collection(BOOKINGS_V2).document(booking_id).update({
             "paymentStatus": "failed",
@@ -168,9 +178,9 @@ def _capture_one(doc):
                 "Client's card was declined",
                 f"The payment for {service_name} failed. You may want to contact the client.",
                 booking_id)
-        return
+        return {"status": "failed", "reason": err_msg}
     except Exception as e:
-        lg.e(f"[captureBookingsDaily] {booking_id} stripe error: {e}")
+        lg.e(f"[{source}] {booking_id} stripe error: {e}")
         fdb.collection(BOOKINGS_V2).document(booking_id).update({
             "paymentStatus": "failed",
             "paymentError": str(e),
@@ -181,7 +191,7 @@ def _capture_one(doc):
                 "Payment couldn't be processed",
                 f"Something went wrong processing payment for {service_name}.",
                 booking_id)
-        return
+        return {"status": "failed", "reason": str(e)}
 
     status = intent.status
 
@@ -209,9 +219,9 @@ def _capture_one(doc):
             "booking_id": booking_id,
             "service_name": booking.get("serviceName", ""),
             "vendor_business_name": booking.get("vendorBusinessName", ""),
-            "source": "captureBookingsDaily",
+            "source": source,
         })
-        lg.t(f"[captureBookingsDaily] {booking_id} captured {intent.id}")
+        lg.t(f"[{source}] {booking_id} captured {intent.id}")
         _notify(client_id, "payment_captured",
                 "Payment received",
                 f"{dollars_label} was charged for {service_name} with {vendor_business}.",
@@ -220,7 +230,7 @@ def _capture_one(doc):
                 "Payment received",
                 f"{dollars_label} from {client_name} for {service_name}.",
                 booking_id)
-        return
+        return {"status": "captured", "paymentIntentId": intent.id}
 
     if status == "requires_action":
         # 3DS prompt — client needs to finish auth through flutter_stripe.
@@ -230,12 +240,16 @@ def _capture_one(doc):
             "paymentIntentClientSecret": intent.client_secret,
             "captureAttemptedAt": datetime.now(timezone.utc),
         })
-        lg.w(f"[captureBookingsDaily] {booking_id} needs 3DS")
+        lg.w(f"[{source}] {booking_id} needs 3DS")
         _notify(client_id, "payment_requires_action",
                 "Finish your payment",
                 f"Your bank wants to verify the payment for {service_name}. Open the booking to complete.",
                 booking_id)
-        return
+        return {
+            "status": "requires_action",
+            "paymentIntentId": intent.id,
+            "clientSecret": intent.client_secret,
+        }
 
     # Any other non-success state (requires_payment_method, canceled, etc.)
     fdb.collection(BOOKINGS_V2).document(booking_id).update({
@@ -248,6 +262,7 @@ def _capture_one(doc):
             "Payment couldn't be completed",
             f"Payment for {service_name} didn't go through. Open the booking to retry.",
             booking_id)
+    return {"status": "failed", "reason": f"intent status {status}"}
 
 
 @scheduler_fn.on_schedule(
@@ -279,7 +294,7 @@ def captureBookingsDaily(event: scheduler_fn.ScheduledEvent) -> None:
     count = 0
     for doc in snap:
         try:
-            _capture_one(doc)
+            capture_booking(doc)
             count += 1
         except Exception as e:
             lg.e(f"[captureBookingsDaily] unexpected error on {doc.id}: {e}")
