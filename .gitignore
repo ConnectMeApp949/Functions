@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# Firebase
+firebase-debug.log
+firebase-debug.*.log
+ui-debug.log
+.firebase/
+.runtimeconfig.json
+firestore-debug.log
+
+# Secrets / env — never commit these
+.env
+.env.*
+*.local
+serviceAccountKey*.json
+credentials.json
+
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Zips — we're using git now, don't need backup zips anymore
+cm_fn.zip

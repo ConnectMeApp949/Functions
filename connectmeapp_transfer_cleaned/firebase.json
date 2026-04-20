@@ -1,0 +1,22 @@
+{
+  "functions": [
+    {
+      "source": "functions",
+      "codebase": "default",
+      "disallowLegacyRuntimeConfig": true,
+      "ignore": [
+        "venv",
+        ".git",
+        "firebase-debug.log",
+        "firebase-debug.*.log",
+        "*.local"
+      ],
+      "runtime": "python313",
+      "secretEnvironmentVariables": [
+        {"key": "STRIPE_SECRET_KEY", "secret": "STRIPE_SECRET_KEY"},
+        {"key": "ADMIN_UTILS_PASSWORD", "secret": "ADMIN_UTILS_PASSWORD"},
+        {"key": "TEST_USER_PASSWORD", "secret": "TEST_USER_PASSWORD"}
+      ]
+    }
+  ]
+}
